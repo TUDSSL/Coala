@@ -1,0 +1,319 @@
+#include <msp430.h>
+//#include <mspDebugger.h>
+
+#include <ctlflags.h>
+#include <dataprotect.h>
+#include <checkpoint.h>
+
+// TODO: Instead of a naive FIFO replacement policy,
+// can't we search the working buffer for a non-dirty page?
+
+// TODO: Can the second phase of the commit be skipped?
+// Instead of copying a page from shadow to store,
+// that page's shadow buffer could be marked as store.
+
+// TODO: insert comments inside functions
+
+#define PRF_PORT 3
+#define PRF_PIN  6
+
+/**
+ * Arrays of pointers to shadow buffer (dirty) pages.
+ *
+ * Counter-intuitively, elements of the array point at pages in the store
+ * buffer, even though they indicate dirty pages lying in the shadow buffer.
+ *
+ * TODO: this array consumes too much of the SRAM
+ */
+uint16_t __pages_in_shadow_buf[NUM_PRS_PAGS] = {0};  // This can be pretty big and consume large section of the SRAM, therefore I shift it to FRAM
+__nv uint16_t __pages_in_shadow_buf_prs[NUM_PRS_PAGS] = {0};
+
+
+volatile uint16_t swap_index = 0;
+
+uint16_t last_var_pg_tag = 0;
+uint16_t last_ram_page_idx = 0;
+uint16_t last_ram_pg_tag = 0;
+
+// Initialize only first RAM page.
+__ram_page_meta __ram_pages_buf[RAM_BUF_LEN] = {
+    {BGN_RAM, CLR_DIRTY_PAGE, BGN_PRS}
+};
+
+__nv uint16_t shadow_buf_pages_count = 0;
+__nv uint16_t commit_page_idx = 0; // to enable incremental commit
+__nv uint16_t page_fault_counter = 0;
+__nv uint16_t fullpage_fault_counter = 0;
+
+uint16_t dma_clr_word = 0;
+
+
+void __checkpoint_init()
+{
+    dma = TRUE;                 // method of data transfer: dma (1) or standard data copying (0)
+    light = TRUE;               // method of checkpointing: only stack (1) or full ram (0)
+
+    if (!__checkpoint_available) {
+        latest_cp_loc = nvm_b;      // First copy to FRAM will be to nvm_a
+        restoring = FALSE;          // Not just restored
+        PLC = 0;                    // Reset Power Loss Counter
+        finished = FALSE;
+    }
+}
+
+
+uint16_t __return_addr_no_check(uint16_t var_fram_addr)
+{
+    msp_gpio_set(PRF_PORT, PRF_PIN);
+    uint16_t ret;
+
+    // volatile uint16_t ram_page_idx = 0;
+    uint16_t ram_page_idx = 0;
+    uint16_t fram_pg_tag;
+    uint16_t var_pg_tag = var_fram_addr & ~(PAG_SIZE - 1);
+
+    if (var_pg_tag == last_var_pg_tag) {
+        // ret = __ram_pages_buf[last_ram_page_idx].ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+        ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+        msp_gpio_clear(PRF_PORT, PRF_PIN);
+        return ret;
+    }
+    last_var_pg_tag = var_pg_tag;
+
+    // Search in (SRAM) working buffer.
+    while ((fram_pg_tag = __ram_pages_buf[ram_page_idx].fram_pg_tag)) {
+        // if (__is_var_in_ram_page(var_fram_addr, __ram_pages_buf[ram_page_idx])) {
+        //     ret = __var_pt_in_ram_page(var_fram_addr, __ram_pages_buf[ram_page_idx]);
+        //     msp_gpio_clear(PRF_PORT, PRF_PIN);
+        //     return ret;
+        // }
+        if (fram_pg_tag == var_pg_tag) {
+            last_ram_page_idx = ram_page_idx;
+            last_ram_pg_tag = __ram_pages_buf[ram_page_idx].ram_pg_tag;
+            ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+            msp_gpio_clear(PRF_PORT, PRF_PIN);
+            return ret;
+        }
+        ram_page_idx++;
+        if (ram_page_idx == RAM_BUF_LEN) break;
+    }
+
+    swap_index++;
+    if (swap_index >= RAM_BUF_LEN) {
+        swap_index = 0;
+    }
+
+    // __swap_page(
+    //     var_fram_addr,
+    //     &__ram_pages_buf[swap_index].is_dirty,
+    //     &__ram_pages_buf[swap_index].fram_pg_tag,
+    //     __ram_pages_buf[swap_index].ram_pg_tag
+    // );
+    __swap_page(var_fram_addr, &__ram_pages_buf[swap_index]);
+
+    // ret = __var_pt_in_ram_page(var_fram_addr, __ram_pages_buf[swap_index]);
+    last_ram_page_idx = swap_index;
+    last_ram_pg_tag = __ram_pages_buf[swap_index].ram_pg_tag;
+    ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+    msp_gpio_clear(PRF_PORT, PRF_PIN);
+    return ret;
+}
+
+
+uint16_t __return_addr_wr_no_check(uint16_t var_fram_addr)
+{
+    msp_gpio_set(PRF_PORT, PRF_PIN);
+    uint16_t ret;
+
+    // volatile uint16_t ram_page_idx = 0;
+    uint16_t ram_page_idx = 0;
+    uint16_t fram_pg_tag;
+    uint16_t var_pg_tag = var_fram_addr & ~(PAG_SIZE - 1);
+
+    if (var_pg_tag == last_var_pg_tag) {
+        __ram_pages_buf[last_ram_page_idx].is_dirty = 1;
+        // ret = __ram_pages_buf[last_ram_page_idx].ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+        ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+        msp_gpio_clear(PRF_PORT, PRF_PIN);
+        return ret;
+    }
+    last_var_pg_tag = var_pg_tag;
+
+    // Search in (SRAM) working buffer.
+    while ((fram_pg_tag = __ram_pages_buf[ram_page_idx].fram_pg_tag)) {
+        // if (__is_var_in_ram_page(var_fram_addr, __ram_pages_buf[ram_page_idx])) {
+        //     __ram_pages_buf[ram_page_idx].is_dirty = 1;
+        //     ret = __var_pt_in_ram_page(var_fram_addr, __ram_pages_buf[ram_page_idx]);
+        //     msp_gpio_clear(PRF_PORT, PRF_PIN);
+        //     return ret;
+        // }
+        if (fram_pg_tag == var_pg_tag) {
+            __ram_pages_buf[ram_page_idx].is_dirty = 1;
+            last_ram_page_idx = ram_page_idx;
+            last_ram_pg_tag = __ram_pages_buf[ram_page_idx].ram_pg_tag;
+            ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+            msp_gpio_clear(PRF_PORT, PRF_PIN);
+            return ret;
+        }
+        ram_page_idx++;
+        if (ram_page_idx == RAM_BUF_LEN) break;
+    }
+
+    swap_index++;
+    if (swap_index >= RAM_BUF_LEN) {
+        swap_index = 0;
+    }
+
+    // __swap_page(
+    //     var_fram_addr,
+    //     &__ram_pages_buf[swap_index].is_dirty,
+    //     &__ram_pages_buf[swap_index].fram_pg_tag,
+    //     __ram_pages_buf[swap_index].ram_pg_tag
+    // );
+    __swap_page(var_fram_addr, &__ram_pages_buf[swap_index]);
+    
+    __ram_pages_buf[swap_index].is_dirty = 1;
+
+    // ret = __var_pt_in_ram_page(var_fram_addr, __ram_pages_buf[swap_index]);
+    last_ram_page_idx = swap_index;
+    last_ram_pg_tag = __ram_pages_buf[swap_index].ram_pg_tag;
+    ret = last_ram_pg_tag + (var_fram_addr & (PAG_SIZE - 1));
+    msp_gpio_clear(PRF_PORT, PRF_PIN);
+    return ret;
+}
+
+
+void __copy_page(uint16_t from, uint16_t to)
+{
+    // Configure DMA channel 1.
+    // __data16_write_addr((unsigned short) &DMA1SA, (unsigned long) (from)); // Source
+    // __data16_write_addr((unsigned short) &DMA1DA, (unsigned long) (to)); // Destination
+    DMA1SAL = from;
+    DMA1DAL = to;
+    DMA1SZ = PAG_SIZE_W;                             // block size
+    // DMA1CTL = DMADT_5 | DMASRCINCR_3 | DMADSTINCR_3; // RPT, INC
+    DMA1CTL = DMADT_1 | DMASRCINCR_3 | DMADSTINCR_3; // single block, increment addresses
+    DMA1CTL |= DMAEN;                                // enable DMA
+
+    // Trigger block transfer.
+    DMA1CTL |= DMAREQ;
+}
+
+
+void __dma_clear_words(uint16_t address, uint16_t length)
+{
+    DMA1SAL = (uint16_t) &dma_clr_word;
+    DMA1DAL = address;
+    DMA1SZ = length;                                 // block size
+    // DMA1CTL = DMADT_5 | DMASRCINCR_3 | DMADSTINCR_3; // RPT, INC
+    DMA1CTL = DMADT_1 | DMASRCINCR_0 | DMADSTINCR_3; // single block, increment addresses
+    DMA1CTL |= DMAEN;                                // enable DMA
+
+    // Trigger block transfer.
+    DMA1CTL |= DMAREQ;
+}
+
+
+void __copy_page_to_shadow_buf(uint16_t from, uint16_t to)
+{
+    __copy_page(from, (to + APP_MEM_SIZE));
+
+    uint16_t idx = 0;
+    while (__pages_in_shadow_buf[idx] != 0) {
+        if (to == __pages_in_shadow_buf[idx]) {
+            break;
+        }
+        idx++;
+    }
+    
+    // Keep track of the buffered pages
+    __pages_in_shadow_buf[idx] = to;
+}
+
+
+void __swap_page(uint16_t var_fram_addr, __ram_page_meta* victim)
+{
+#if PAG_FAULT_CNTR
+    page_fault_counter++;
+    if (victim->is_dirty) {
+        fullpage_fault_counter++;
+    }
+#endif
+
+    /* Find the requested page. */
+    uint16_t page_pt;
+
+    // TODO we are not checking if the var is not in any page!
+    uint16_t i = 0;
+
+    // Search the page in the buffer
+    while ((page_pt = __pages_in_shadow_buf[i]) != 0) {
+        // Compare page tags.
+        if (page_pt == (var_fram_addr & ~(PAG_SIZE - 1))) {
+            if (victim->is_dirty) {
+                __copy_page_to_shadow_buf(victim->ram_pg_tag, victim->fram_pg_tag);
+                victim->is_dirty = CLR_DIRTY_PAGE;
+            }
+            __copy_page((page_pt + APP_MEM_SIZE), victim->ram_pg_tag);
+            goto PAG_IN_TEMP;
+        }
+        i++;
+    }
+
+    page_pt = var_fram_addr & ~(PAG_SIZE - 1);
+
+    if (victim->is_dirty) {
+        __copy_page_to_shadow_buf(victim->ram_pg_tag, victim->fram_pg_tag);
+        victim->is_dirty = CLR_DIRTY_PAGE;
+    }
+    __copy_page(page_pt, victim->ram_pg_tag);
+
+PAG_IN_TEMP:
+
+    victim->fram_pg_tag = page_pt;
+}
+
+
+void __commit_to_store_buf()
+{
+    // TODO: what if the __pages_in_shadow_buf_prs is full, there will be an error!!! 
+    // while (__pages_in_shadow_buf_prs[commit_page_idx]) {
+    //     __copy_page(
+    //         (__pages_in_shadow_buf_prs[commit_page_idx] + APP_MEM_SIZE),
+    //         __pages_in_shadow_buf_prs[commit_page_idx]
+    //     );
+    //     commit_page_idx++;
+    // }
+
+    while (commit_page_idx < shadow_buf_pages_count) {
+        __copy_page(
+            (__pages_in_shadow_buf_prs[commit_page_idx] + APP_MEM_SIZE),
+            __pages_in_shadow_buf_prs[commit_page_idx]
+        );
+        commit_page_idx++;
+    }
+
+    uint16_t i = commit_page_idx;
+    while (i) {
+        __pages_in_shadow_buf[i - 1] = 0;
+        __pages_in_shadow_buf_prs[i - 1] = 0;
+        i--;
+    }
+
+    // TODO:
+    // Clear __pages_in_shadow_buf using DMA
+    // DMA1SAL = (uint16_t) &dma_clr_word;
+    // DMA1DAL = (uint16_t) __pages_in_shadow_buf;
+    // DMA1SZ = shadow_buf_pages_count >> 1;
+    // DMA1CTL = DMADT_1 | DMASRCINCR_0 | DMADSTINCR_3;
+    // DMA1CTL |= DMAEN;
+    // DMA1CTL |= DMAREQ;
+
+    // Clear __pages_in_shadow_buf_prs using DMA
+    // DMA1DAL = (uint16_t) __pages_in_shadow_buf_prs;
+    // DMA1CTL |= DMAEN;
+    // DMA1CTL |= DMAREQ;
+
+    shadow_buf_pages_count = 0;
+    commit_page_idx = 0;
+}
