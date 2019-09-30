@@ -16,25 +16,9 @@ PRS (rx)         : ORIGIN = 0xBF70, LENGTH = 0x400f /* END=0xFF7F, size 8016 */
 ## Protected variables 
 
 ### Annotation 
-All protected variables must be global and annotated with `__p`
+Protected variables must be global and annotated with `COALA_PV(<data type>, var)`
+Coala tasks declaration, `COALA_TASK(<tasl name>, <task weight>)`
 
 ### Access 
 A protected variable must be written to with `WP(var)`
 A protected variable must be read from with `RP(var)`
-
-## TODO
-- Port `dataDecompression` to the new Coala version
-- Revise applications
-- Enhance this README
-
-## Coala VS Alpaca data acquisition
-
-Acquired: `bc`, `ar`, `cem`
-
-Ready to be acquired:
-
-To validate results:
-
-To revise: `cuckoo`
-
-To port (from Coala to Alpaca or vice-versa): `rsa`, `dataDecompression`
