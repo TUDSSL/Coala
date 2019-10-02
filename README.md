@@ -29,13 +29,12 @@ PRS (rx)         : ORIGIN = 0xBF70, LENGTH = 0x400f /* END=0xFF7F, size 8016 */
 ```
 
 
-developing applications with Coala
+Developing applications with Coala
 -----------------------------------
 * Coala library and applications can be build with GCC or Clang. 
-* To build an application `cd` to `Coala-Repo\apps\<app>` and write `Make` in the 
-application directory. 
-* To build Coala `cd` to `Coala-Repo\coala` write `Make` 
-* Coala's repository structure
+* To build an application `cd` to `Coala-Repo\apps\<app>` and write `Make`. 
+* To build Coala library `cd` to `Coala-Repo\coala` write `Make`.
+* Coala's repository structure:
 ```
 Coala-Repo
 │
